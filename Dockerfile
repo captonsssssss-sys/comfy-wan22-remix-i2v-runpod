@@ -7,14 +7,15 @@ USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ENV COMFYUI_PATH=/default-comfyui-bundle/ComfyUI
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Устанавливаем curl, Python и ffmpeg, если их нет в базовом образе.
+# Устанавливаем только необходимые системные инструменты.
+# Системный ffmpeg намеренно не устанавливаем:
+# в базовом образе его библиотеки конфликтуют между собой.
 RUN set -eux; \
-    NEED_INSTALL=0; \
-    command -v curl >/dev/null 2>&1 || NEED_INSTALL=1; \
-    command -v python3 >/dev/null 2>&1 || NEED_INSTALL=1; \
-    command -v ffmpeg >/dev/null 2>&1 || NEED_INSTALL=1; \
-    if [ "${NEED_INSTALL}" -eq 1 ]; then \
+    if ! command -v curl >/dev/null 2>&1 || \
+       ! command -v python3 >/dev/null 2>&1 || \
+       ! python3 -m pip --version >/dev/null 2>&1; then \
         if command -v apt-get >/dev/null 2>&1; then \
             apt-get update; \
             apt-get install -y --no-install-recommends \
@@ -22,7 +23,7 @@ RUN set -eux; \
                 curl \
                 ca-certificates \
                 python3 \
-                ffmpeg; \
+                python3-pip; \
             rm -rf /var/lib/apt/lists/*; \
         elif command -v apk >/dev/null 2>&1; then \
             apk add --no-cache \
@@ -30,14 +31,14 @@ RUN set -eux; \
                 curl \
                 ca-certificates \
                 python3 \
-                ffmpeg; \
+                py3-pip; \
         elif command -v dnf >/dev/null 2>&1; then \
             dnf install -y \
                 bash \
                 curl \
                 ca-certificates \
                 python3 \
-                ffmpeg; \
+                python3-pip; \
             dnf clean all; \
         elif command -v microdnf >/dev/null 2>&1; then \
             microdnf install -y \
@@ -45,7 +46,7 @@ RUN set -eux; \
                 curl \
                 ca-certificates \
                 python3 \
-                ffmpeg; \
+                python3-pip; \
             microdnf clean all; \
         elif command -v yum >/dev/null 2>&1; then \
             yum install -y \
@@ -53,7 +54,7 @@ RUN set -eux; \
                 curl \
                 ca-certificates \
                 python3 \
-                ffmpeg; \
+                python3-pip; \
             yum clean all; \
         else \
             echo "ERROR: пакетный менеджер не найден"; \
@@ -62,14 +63,38 @@ RUN set -eux; \
     fi; \
     curl --version; \
     python3 --version; \
-    ffmpeg -version | head -n 1
+    python3 -m pip --version
 
-# Устойчивый загрузчик моделей.
-# Использует HTTP/1.1 и продолжает скачивание после обрыва.
+# Устанавливаем отдельный рабочий ffmpeg.
+# Он не использует сломанные libavdevice/libavcodec из базового образа.
+RUN set -eux; \
+    python3 -m pip install \
+        --no-cache-dir \
+        imageio-ffmpeg; \
+    FFMPEG_SOURCE="$(python3 -c \
+        'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')"; \
+    echo "Static ffmpeg source: ${FFMPEG_SOURCE}"; \
+    test -x "${FFMPEG_SOURCE}"; \
+    rm -f /usr/local/bin/ffmpeg; \
+    rm -f /usr/bin/ffmpeg; \
+    ln -s "${FFMPEG_SOURCE}" /usr/local/bin/ffmpeg; \
+    ln -s "${FFMPEG_SOURCE}" /usr/bin/ffmpeg; \
+    hash -r; \
+    test "$(command -v ffmpeg)" = "/usr/local/bin/ffmpeg" || \
+        test "$(command -v ffmpeg)" = "/usr/bin/ffmpeg"; \
+    ffmpeg -version | head -n 3
+
+ENV IMAGEIO_FFMPEG_EXE=/usr/local/bin/ffmpeg
+ENV FFMPEG_BINARY=/usr/local/bin/ffmpeg
+
+# Создаём устойчивый загрузчик моделей.
+# HTTP/1.1 устраняет частые ошибки curl 92 от Hugging Face.
+# Незавершённые файлы сохраняются как .part.
 RUN cat > /usr/local/bin/download-model <<'SCRIPT'
 #!/usr/bin/env bash
 
 set -u
+set -o pipefail
 
 URL="$1"
 OUTPUT="$2"
@@ -91,9 +116,10 @@ while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
     if [ -s "${PART}" ]; then
         PART_SIZE="$(stat -c%s "${PART}")"
         echo "Partial file found: ${PART_SIZE} bytes"
+        echo "Continuing download"
         RESUME_ARGS=(--continue-at -)
     else
-        echo "Starting from zero"
+        echo "Starting download from zero"
     fi
 
     curl \
@@ -127,17 +153,18 @@ while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
 
     echo "curl exited with code ${CURL_CODE}"
 
-    # Сервер не поддержал продолжение загрузки.
-    # Удаляем partial-файл и начинаем заново.
-    if [ "${CURL_CODE}" -eq 33 ] || [ "${CURL_CODE}" -eq 36 ]; then
-        echo "Resume is not supported. Restarting from zero."
+    # Сервер не разрешил продолжение файла.
+    # Удаляем partial и начинаем следующую попытку с нуля.
+    if [ "${CURL_CODE}" -eq 33 ] || \
+       [ "${CURL_CODE}" -eq 36 ]; then \
+        echo "Resume is unsupported. Restarting from zero."
         rm -f "${PART}"
     fi
 
     ATTEMPT=$((ATTEMPT + 1))
 
     if [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; then
-        echo "Waiting 15 seconds..."
+        echo "Waiting 15 seconds"
         sleep 15
     fi
 done
@@ -148,7 +175,7 @@ SCRIPT
 
 RUN chmod +x /usr/local/bin/download-model
 
-# Проверяем расположение ComfyUI.
+# Проверяем структуру ComfyUI.
 RUN set -eux; \
     test -d "${COMFYUI_PATH}"; \
     test -d "${COMFYUI_PATH}/models"; \
@@ -156,14 +183,14 @@ RUN set -eux; \
     test -d "${COMFYUI_PATH}/user"; \
     echo "ComfyUI found at ${COMFYUI_PATH}"
 
-# До скачивания тяжёлых моделей проверяем core-ноды WAN.
+# Проверяем основные встроенные WAN-ноды до скачивания моделей.
 RUN set -eux; \
     grep -RIl \
         --exclude-dir=".git" \
         --include="*.py" \
         "WanImageToVideo" \
         "${COMFYUI_PATH}" | head -n 1 | grep -q . || { \
-            echo "ERROR: WanImageToVideo отсутствует в базовом образе"; \
+            echo "ERROR: WanImageToVideo отсутствует"; \
             exit 1; \
         }; \
     grep -RIl \
@@ -176,32 +203,26 @@ RUN set -eux; \
         }; \
     echo "WAN core nodes found"
 
-# Проверяем все кастомные ноды до загрузки моделей.
+# Проверяем кастомные ноды из workflow.
 RUN set -eux; \
-    find "${COMFYUI_PATH}/custom_nodes" \
-        -maxdepth 2 \
-        -type d \
-        -iname "*KJNodes*" \
-        -print \
-        -quit | grep -q . || { \
+    grep -RIl \
+        --exclude-dir=".git" \
+        "INTConstant" \
+        "${COMFYUI_PATH}/custom_nodes" | head -n 1 | grep -q . || { \
             echo "ERROR: ComfyUI-KJNodes отсутствует"; \
             exit 1; \
         }; \
-    find "${COMFYUI_PATH}/custom_nodes" \
-        -maxdepth 2 \
-        -type d \
-        \( -iname "*essentials*" -o -iname "*essential*" \) \
-        -print \
-        -quit | grep -q . || { \
+    grep -RIl \
+        --exclude-dir=".git" \
+        "ImageResize+" \
+        "${COMFYUI_PATH}/custom_nodes" | head -n 1 | grep -q . || { \
             echo "ERROR: ComfyUI Essentials отсутствует"; \
             exit 1; \
         }; \
-    find "${COMFYUI_PATH}/custom_nodes" \
-        -maxdepth 2 \
-        -type d \
-        -iname "*rgthree*" \
-        -print \
-        -quit | grep -q . || { \
+    grep -RIl \
+        --exclude-dir=".git" \
+        "Seed (rgthree)" \
+        "${COMFYUI_PATH}/custom_nodes" | head -n 1 | grep -q . || { \
             echo "ERROR: rgthree-comfy отсутствует"; \
             exit 1; \
         }; \
@@ -216,19 +237,19 @@ RUN set -eux; \
         --exclude-dir=".git" \
         "VHS_VideoCombine" \
         "${COMFYUI_PATH}/custom_nodes" | head -n 1 | grep -q . || { \
-            echo "ERROR: ComfyUI-VideoHelperSuite отсутствует"; \
+            echo "ERROR: VideoHelperSuite отсутствует"; \
             exit 1; \
         }; \
     grep -RIl \
         --exclude-dir=".git" \
         "RIFEInterpolation" \
         "${COMFYUI_PATH}/custom_nodes" | head -n 1 | grep -q . || { \
-            echo "ERROR: RIFEInterpolation отсутствует"; \
+            echo "ERROR: ComfyUI-VFI отсутствует"; \
             exit 1; \
         }; \
-    echo "All required custom nodes found"
+    echo "Required custom nodes found"
 
-# Полностью очищаем все workflow-папки.
+# Полностью удаляем старые workflow.
 RUN set -eux; \
     for ROOT in \
         "${COMFYUI_PATH}" \
@@ -251,7 +272,7 @@ RUN set -eux; \
         fi; \
     done
 
-# Удаляем все старые модели из базового образа.
+# Очищаем модели базового образа и создаём нужные папки.
 RUN set -eux; \
     find "${COMFYUI_PATH}/models" \
         -mindepth 1 \
@@ -275,13 +296,14 @@ RUN /usr/local/bin/download-model \
     "https://huggingface.co/limiao1666/qw_nsfw/resolve/main/Wan2.2_Remix_NSFW_i2v_14b_low_lighting_v2.0.safetensors" \
     "${COMFYUI_PATH}/models/diffusion_models/Wan2.2_Remix_NSFW_i2v_14b_low_lighting_v2.0.safetensors"
 
-# NSFW WAN UMT5 XXL.
+# WAN NSFW UMT5 XXL.
 RUN /usr/local/bin/download-model \
     "https://huggingface.co/Osrivers/nsfw_wan_umt5-xxl_fp8_scaled.safetensors/resolve/main/nsfw_wan_umt5-xxl_fp8_scaled.safetensors" \
     "${COMFYUI_PATH}/models/text_encoders/nsfw_wan_umt5-xxl_fp8_scaled.safetensors"
 
 # WAN VAE.
-# Сохраняем под точным названием, указанным в workflow.
+# В workflow указано имя с заглавными W и V,
+# поэтому сохраняем файл именно под таким названием.
 RUN /usr/local/bin/download-model \
     "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors" \
     "${COMFYUI_PATH}/models/vae/Wan2.1_VAE.safetensors"
@@ -291,8 +313,8 @@ RUN /usr/local/bin/download-model \
     "https://huggingface.co/DeepBeepMeep/Wan2.1/resolve/main/flownet.pkl" \
     "/opt/comfy-model-assets/flownet.pkl"
 
-# Размещаем flownet.pkl в нескольких стандартных путях,
-# чтобы RIFE-нода гарантированно его обнаружила.
+# Определяем папку установленной RIFE-ноды
+# и размещаем flownet.pkl во всех поддерживаемых расположениях.
 RUN set -eux; \
     RIFE_MATCH="$(grep -RIl \
         --exclude-dir=".git" \
@@ -302,7 +324,7 @@ RUN set -eux; \
     RELATIVE_PATH="${RIFE_MATCH#${COMFYUI_PATH}/custom_nodes/}"; \
     RIFE_FOLDER_NAME="${RELATIVE_PATH%%/*}"; \
     RIFE_ROOT="${COMFYUI_PATH}/custom_nodes/${RIFE_FOLDER_NAME}"; \
-    echo "RIFE custom node root: ${RIFE_ROOT}"; \
+    echo "RIFE root: ${RIFE_ROOT}"; \
     for MODEL_DIR in \
         "${COMFYUI_PATH}/models/rife" \
         "${RIFE_ROOT}/ckpts/rife" \
@@ -319,7 +341,7 @@ RUN set -eux; \
         "/opt/comfy-model-assets/flownet.pkl" \
         "${RIFE_ROOT}/flownet.pkl"
 
-# Добавляем единственный workflow.
+# Добавляем только этот workflow.
 COPY WAN22_REMIX_I2V.json /tmp/WAN22_REMIX_I2V.json
 
 RUN set -eux; \
@@ -328,7 +350,7 @@ RUN set -eux; \
         "${COMFYUI_PATH}/user/default/workflows/WAN22_REMIX_I2V.json"; \
     rm -f "/tmp/WAN22_REMIX_I2V.json"
 
-# Проверяем наличие всех файлов.
+# Проверяем наличие моделей.
 RUN set -eux; \
     test -s "${COMFYUI_PATH}/models/diffusion_models/Wan2.2_Remix_NSFW_i2v_14b_high_lighting_v2.0.safetensors"; \
     test -s "${COMFYUI_PATH}/models/diffusion_models/Wan2.2_Remix_NSFW_i2v_14b_low_lighting_v2.0.safetensors"; \
@@ -336,7 +358,7 @@ RUN set -eux; \
     test -s "${COMFYUI_PATH}/models/vae/Wan2.1_VAE.safetensors"; \
     test -s "/opt/comfy-model-assets/flownet.pkl"
 
-# Проверяем минимальные размеры.
+# Проверяем минимальные размеры файлов.
 RUN set -eux; \
     HIGH_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/diffusion_models/Wan2.2_Remix_NSFW_i2v_14b_high_lighting_v2.0.safetensors")"; \
     LOW_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/diffusion_models/Wan2.2_Remix_NSFW_i2v_14b_low_lighting_v2.0.safetensors")"; \
@@ -354,8 +376,7 @@ RUN set -eux; \
     test "${VAE_SIZE}" -gt 100000000; \
     test "${RIFE_SIZE}" -gt 1000000
 
-# Проверяем, что safetensors действительно являются safetensors,
-# а не HTML-страницами с ошибкой Hugging Face.
+# Проверяем структуру safetensors.
 RUN python3 - <<'PY'
 import json
 import struct
@@ -382,17 +403,17 @@ files = [
 
 for path in files:
     with path.open("rb") as file:
-        header_size_raw = file.read(8)
+        raw_header_size = file.read(8)
 
-        if len(header_size_raw) != 8:
-            raise RuntimeError(f"Повреждённый safetensors: {path}")
+        if len(raw_header_size) != 8:
+            raise RuntimeError(f"Повреждённый файл: {path}")
 
-        header_size = struct.unpack("<Q", header_size_raw)[0]
+        header_size = struct.unpack("<Q", raw_header_size)[0]
 
         if header_size <= 2 or header_size > 100_000_000:
             raise RuntimeError(
                 f"Некорректный заголовок safetensors: "
-                f"{path}, header_size={header_size}"
+                f"{path.name}, размер={header_size}"
             )
 
         header = file.read(header_size)
@@ -412,7 +433,7 @@ for path in files:
     print(f"Validated: {path.name}")
 PY
 
-# Проверяем модели и кастомные ноды внутри workflow.
+# Проверяем содержимое workflow.
 RUN python3 - <<'PY'
 import json
 from pathlib import Path
@@ -487,7 +508,12 @@ if missing_models:
 print("Workflow validation passed")
 PY
 
-# Финальная проверка: внутри ComfyUI должен остаться один workflow.
+# Проверяем рабочий ffmpeg ещё раз в финальном слое.
+RUN set -eux; \
+    test -x /usr/local/bin/ffmpeg; \
+    /usr/local/bin/ffmpeg -version | head -n 3
+
+# Проверяем, что внутри ComfyUI остался только один workflow.
 RUN set -eux; \
     find "${COMFYUI_PATH}" \
         -type f \
